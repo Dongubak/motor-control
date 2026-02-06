@@ -20,7 +20,7 @@ def main():
     NUM_MOTORS = 2
 
     # --- Cross Coupling 설정 ---
-    COUPLING_GAIN = 0.1         # 초기 게인 (0.0 ~ 1.0)
+    COUPLING_GAIN = 0.05         # 초기 게인 (0.0 ~ 1.0)
     ENABLE_COUPLING = True      # Cross Coupling 활성화
     MAX_SYNC_ERROR_MM = 0.5     # 동기화 오차 허용 범위 (mm)
 
