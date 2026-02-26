@@ -18,6 +18,7 @@ import struct
 import time
 import math
 import multiprocessing as mp
+from collections import deque
 from typing import List
 
 # --- CiA 402 Controlword & 기본 상수 ---
@@ -33,14 +34,16 @@ z_axis_mm_per_rev = 5.99965657019
 
 # --- 안전 및 Cross Coupling 관련 상수 ---
 DEFAULT_MAX_SYNC_ERROR_MM = 0.5  # 기본 허용 동기화 오차 (mm)
-DEFAULT_COUPLING_GAIN = 0.1     # 기본 Cross Coupling 게인 (0.0 ~ 1.0)
+DEFAULT_COUPLING_GAIN = 0.1      # 기본 Cross Coupling 게인 (0.0 ~ 1.0)
+DEFAULT_MA_WINDOW = 5            # 이동 평균 윈도우 크기 (사이클 수)
 
 
 def _ethercat_process_loop_coupling(
     adapter_name, num_slaves, cycle_time_s,
     command_queue, shared_states, lock,
     max_sync_error_pulse,
-    coupling_params  # 추가: Cross Coupling 파라미터 공유
+    coupling_params,  # Cross Coupling 파라미터 공유
+    ma_window         # 이동 평균 윈도우 크기
 ):
     """
     [COUPLING 버전] 별도의 프로세스에서 실행될 EtherCAT 통신 및 제어 루프.
@@ -58,6 +61,10 @@ def _ethercat_process_loop_coupling(
 
     is_running = True
     sync_error_detected = False
+
+    # 인접 축 쌍(pair)별 위치 차이 이동 평균 히스토리
+    # pair i: Motor i vs Motor i+1, 총 (num_slaves - 1) 개
+    diff_histories = [deque(maxlen=ma_window) for _ in range(max(0, num_slaves - 1))]
 
     # 큐에서 설정 명령 읽기
     slave_configs = {i: {} for i in range(num_slaves)}
@@ -222,6 +229,8 @@ def _ethercat_process_loop_coupling(
                     local_motor_states[slave_idx]['offset'] = current_pos
                     local_motor_states[slave_idx]['target_pulse'] = current_pos
                     sync_error_detected = False
+                    for h in diff_histories:
+                        h.clear()
                     print(f"[디버그] 모터 {slave_idx} 원점 설정: offset={current_pos}")
                 elif cmd == 'MOVE_TO_MM':
                     if sync_error_detected:
@@ -230,6 +239,8 @@ def _ethercat_process_loop_coupling(
                         trajectory_commands.append((slave_idx, value))
                 elif cmd == 'RESET_SYNC_ERROR':
                     sync_error_detected = False
+                    for h in diff_histories:
+                        h.clear()
                     print("[안전] 동기화 오류 플래그 리셋")
 
             # 궤적 처리
@@ -307,20 +318,29 @@ def _ethercat_process_loop_coupling(
             )
 
             # ========================================
-            # [안전 기능] 다축 위치 차이 모니터링
+            # [안전 기능] 다축 위치 차이 모니터링 (이동 평균 필터)
+            # 순간값 대신 최근 ma_window 사이클의 평균 위치 차이로 비교:
+            #   - 노이즈성 스파이크에 의한 오작동 방지
+            #   - 이동 중일 때만 히스토리 갱신
             # ========================================
             if num_slaves >= 2 and not sync_error_detected and any_moving:
                 for i in range(num_slaves - 1):
                     position_diff = abs(relative_positions[i] - relative_positions[i + 1])
+                    diff_histories[i].append(position_diff)
 
-                    if position_diff > max_sync_error_pulse:
+                    avg_diff = sum(diff_histories[i]) / len(diff_histories[i])
+
+                    if avg_diff > max_sync_error_pulse:
                         sync_error_detected = True
-                        diff_mm = position_diff / (PULSES_PER_REVOLUTION * 2) * z_axis_mm_per_rev
+                        raw_mm = position_diff / (PULSES_PER_REVOLUTION * 2) * z_axis_mm_per_rev
+                        avg_mm = avg_diff / (PULSES_PER_REVOLUTION * 2) * z_axis_mm_per_rev
 
                         print(f"\n{'='*60}")
-                        print(f"[긴급 정지] 동기화 오차 초과!")
+                        print(f"[긴급 정지] 동기화 오차 이동 평균 초과!")
                         print(f"  Motor {i} vs Motor {i+1}")
-                        print(f"  위치 차이: {position_diff} pulse ({diff_mm:.3f} mm)")
+                        print(f"  현재 위치 차이: {position_diff} pulse ({raw_mm:.3f} mm)")
+                        print(f"  이동 평균 ({len(diff_histories[i])}/{ma_window}): "
+                              f"{int(avg_diff)} pulse ({avg_mm:.3f} mm)")
                         print(f"  임계값: {max_sync_error_pulse} pulse")
                         print(f"{'='*60}")
 
@@ -355,12 +375,18 @@ def _ethercat_process_loop_coupling(
                     print(f"[Cross Coupling] 상대위치: {[int(p) for p in relative_positions]}")
                     print(f"  평균: {int(avg_relative_position)}, 보정량: {coupling_correction}")
 
-            # 동기화 모니터링 디버그 출력
+            # 동기화 모니터링 디버그 출력 (이동 평균 포함)
             if cycle_counter % 50 == 0 and any_moving and num_slaves >= 2:
                 for i in range(num_slaves - 1):
                     diff = abs(relative_positions[i] - relative_positions[i + 1])
                     diff_mm = diff / (PULSES_PER_REVOLUTION * 2) * z_axis_mm_per_rev
-                    print(f"[동기화] M{i}-M{i+1} 위치차: {diff} pulse ({diff_mm:.3f}mm)")
+                    if diff_histories[i]:
+                        avg_d = sum(diff_histories[i]) / len(diff_histories[i])
+                        avg_mm = avg_d / (PULSES_PER_REVOLUTION * 2) * z_axis_mm_per_rev
+                        print(f"[동기화] M{i}-M{i+1} 위치차: {diff_mm:.3f}mm "
+                              f"(이동평균: {avg_mm:.3f}mm, {len(diff_histories[i])}/{ma_window})")
+                    else:
+                        print(f"[동기화] M{i}-M{i+1} 위치차: {diff_mm:.3f}mm")
 
             # 3. Fault 확인
             fault_detected = False
@@ -574,12 +600,14 @@ class EtherCATBusCoupling:
     - max_sync_error_mm: 허용 동기화 오차 (mm 단위, 기본 0.5mm)
     - coupling_gain: Cross Coupling 게인 (0.0 ~ 1.0, 기본 0.1)
     - enable_coupling: Cross Coupling 활성화 여부 (기본 True)
+    - ma_window: 동기화 오차 이동 평균 윈도우 크기 (기본 5 사이클)
     """
 
     def __init__(self, adapter_name: str, num_slaves: int, cycle_time_ms: int = 50,
                  max_sync_error_mm: float = DEFAULT_MAX_SYNC_ERROR_MM,
                  coupling_gain: float = DEFAULT_COUPLING_GAIN,
-                 enable_coupling: bool = True):
+                 enable_coupling: bool = True,
+                 ma_window: int = DEFAULT_MA_WINDOW):
         self._command_queue = mp.Queue()
         self._lock = mp.Lock()
         self._shared_states = mp.Array('d', num_slaves * 5, lock=False)
@@ -593,6 +621,7 @@ class EtherCATBusCoupling:
         self._adapter_name = adapter_name
         self._num_slaves = num_slaves
         self._max_sync_error_mm = max_sync_error_mm
+        self._ma_window = ma_window
 
         # mm를 pulse로 변환 (z축 기준)
         self._max_sync_error_pulse = int(
@@ -605,7 +634,8 @@ class EtherCATBusCoupling:
                 adapter_name, num_slaves, cycle_time_ms / 1000.0,
                 self._command_queue, self._shared_states, self._lock,
                 self._max_sync_error_pulse,
-                self._coupling_params
+                self._coupling_params,
+                ma_window
             )
         )
         self.motors: List[MotorCoupling] = [
@@ -617,6 +647,7 @@ class EtherCATBusCoupling:
         self._process.start()
         print(f"[COUPLING] EtherCAT 버스 시작")
         print(f"  동기화 오차 허용: {self._max_sync_error_mm}mm")
+        print(f"  동기화 오차 이동 평균 윈도우: {self._ma_window} 사이클")
         print(f"  Cross Coupling 게인: {self._coupling_params[0]:.2f}")
         print(f"  Cross Coupling 활성화: {self._coupling_params[1] != 0}")
 

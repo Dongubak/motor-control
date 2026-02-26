@@ -20,9 +20,10 @@ def main():
     NUM_MOTORS = 2
 
     # --- Cross Coupling 설정 ---
-    COUPLING_GAIN = 0.05         # 초기 게인 (0.0 ~ 1.0)
+    COUPLING_GAIN = 0.05        # 초기 게인 (0.0 ~ 1.0)
     ENABLE_COUPLING = True      # Cross Coupling 활성화
     MAX_SYNC_ERROR_MM = 0.5     # 동기화 오차 허용 범위 (mm)
+    MA_WINDOW = 5               # 이동 평균 윈도우 (10ms × 5 = 50ms 평균)
 
     # --- 버스 생성 ---
     bus = EtherCATBusCoupling(
@@ -31,7 +32,8 @@ def main():
         cycle_time_ms=10,
         max_sync_error_mm=MAX_SYNC_ERROR_MM,
         coupling_gain=COUPLING_GAIN,
-        enable_coupling=ENABLE_COUPLING
+        enable_coupling=ENABLE_COUPLING,
+        ma_window=MA_WINDOW
     )
 
     motor1 = bus.motors[0]
