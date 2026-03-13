@@ -600,6 +600,8 @@ class MotorControlGUI(QMainWindow):
 
     def _on_num_motors_changed(self, n: int):
         """모터 수 변경 시 런타임 위젯 및 모니터링 재구성"""
+        if not hasattr(self, '_runtime_panel'):
+            return
         self._runtime_panel.rebuild_motor_widgets(
             n, on_origin=self._on_set_origin, on_move=self._on_move_motor
         )
