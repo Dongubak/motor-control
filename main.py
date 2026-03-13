@@ -1,43 +1,54 @@
 from motor import EtherCATBus
 import time
+import signal
+import sys
+
+_bus_ref = None  # 전역 버스 참조 (signal 핸들러용)
+
+def _shutdown_handler(_signum, _frame):
+    """SIGINT/SIGTERM 수신 시 정상 종료 시퀀스 실행"""
+    print("\n[신호] 종료 신호 수신 → 정상 종료 시도...")
+    if _bus_ref is not None:
+        _bus_ref.stop()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT,  _shutdown_handler)
+signal.signal(signal.SIGTERM, _shutdown_handler)
 
 def main():
     # --- 장치 포트 및 슬레이브 수 설정 ---
 
     # adapter = r'\Device\NPF_{F8EF3044-171D-407C-A166-9EEA524F051C}' < 이전 변수 값임
     
-    adapter = r'\Device\NPF_{A3C1307F-C4D5-4126-8FCF-A191BF2B1257}'
-    NUM_MOTORS = 1
+    adapter = r'\Device\NPF_{CD2150F2-B355-4A6F-95BA-EB897A3726BF}'
+    NUM_MOTORS = 3
 
     # --- 단일 버스 관리자 생성 ---
     # 사이클 타임을 10ms로 단축하여 더 부드러운 움직임 구현
     bus = EtherCATBus(adapter_name=adapter, num_slaves=NUM_MOTORS, cycle_time_ms=10)
     
     # --- 각 모터에 대한 핸들 가져오기 ---
-    motor1 = bus.motors[0]  # 슬레이브 인덱스 0 사용
-
-    # [2개 모터로 확장 시]
-    # NUM_MOTORS = 2로 변경하고 아래 주석 해제
-    # motor2 = bus.motors[1]
+    motor1 = bus.motors[1]  # 슬레이브 인덱스 1 사용
+    motor2 = bus.motors[2]
 
     try:
         # --- 축 설정 (버스 시작 전) ---
         motor1.set_axis('z')
-        # motor2.set_axis('z')  # 2개 모터 사용 시 주석 해제
+        motor2.set_axis('z')
 
         # --- SDO 설정 (버스 시작 전) ---
         # 버스가 OP 상태에 들어가기 전에 속도, 가감속도 등 파라미터를 설정합니다.
-        motor1.set_profile_velocity(rpm=50)  # 속도는 50 RPM
-        motor1.set_profile_accel_decel(accel_rpm_per_sec=50)  # 가감속도를 50으로 낮춤 (부드러운 움직임)
+        motor1.set_profile_velocity(rpm=30)
+        motor1.set_profile_accel_decel(accel_rpm_per_sec=30)
 
-        # motor2.set_profile_velocity(rpm=50)  # 2개 모터 사용 시 주석 해제
-        # motor2.set_profile_accel_decel(accel_rpm_per_sec=50)
+        motor2.set_profile_velocity(rpm=30)
+        motor2.set_profile_accel_decel(accel_rpm_per_sec=30)
 
         # --- 버스 시작 (모든 모터에 대한 통신 시작) ---
         bus.start()
-        
-        # --- 사용할 모터만 준비 대기 ---
-        for motor in [motor1]:  # 2개 모터 사용 시: [motor1, motor2]
+
+        # --- 모터 준비 대기 ---
+        for motor in [motor1, motor2]:
             print(f"모터 {motor._index} 준비 대기 중...")
             start_time = time.monotonic()
             while (motor.status_word & 0x006F) != 0x0027:
@@ -52,17 +63,17 @@ def main():
 
         # --- 원점 설정 ---
         motor1.set_origin()
-        # motor2.set_origin()  # 2개 모터 사용 시 주석 해제
-        time.sleep(0.5)  # 원점 설정 명령이 처리될 충분한 시간 제공
+        motor2.set_origin()
+        time.sleep(0.5)
 
-        print(f"원점 설정 후 위치: M1={motor1.current_position_mm:.2f}mm")
-        print(f"[디버그] 펄스 정보 - M1: {motor1.current_position_pulse}")
-        print(f"[디버그] 오프셋 정보 - M1: {motor1.offset_pulse}")
-        print(f"[디버그] 펄스-오프셋 차이 - M1: {motor1.current_position_pulse - motor1.offset_pulse}")
+        print(f"원점 설정 후 위치: M1={motor1.current_position_mm:.2f}mm, M2={motor2.current_position_mm:.2f}mm")
+        print(f"[디버그] 펄스 정보    - M1: {motor1.current_position_pulse}, M2: {motor2.current_position_pulse}")
+        print(f"[디버그] 오프셋 정보  - M1: {motor1.offset_pulse}, M2: {motor2.offset_pulse}")
+        print(f"[디버그] 펄스-오프셋  - M1: {motor1.current_position_pulse - motor1.offset_pulse}, M2: {motor2.current_position_pulse - motor2.offset_pulse}")
 
         # --- 이동 전 상태 검증 및 복구 ---
         print("\n--- 이동 전 모터 상태 검증 ---")
-        for motor in [motor1]:  # 2개 모터 사용 시: [motor1, motor2]
+        for motor in [motor1, motor2]:  # 2개 모터 사용 시: [motor1, motor2]
             status = motor.status_word
             print(f"모터 {motor._index} 상태:")
             print(f"  Status Word: 0x{status:04X}")
@@ -110,23 +121,24 @@ def main():
         # --- 이동 시작 (CSP 모드) ---
         print("\n--- 이동 시작 (CSP 모드) ---")
         # CSP 모드에서는 명령을 보내면 궤적이 자동으로 생성됩니다.
-        motor1.move_to_position_mm(-50)
-        # motor2.move_to_position_mm(-50)  # 2개 모터 사용 시 주석 해제
 
-        # 이동이 완료될 때까지 대기 (is_moving()이 False가 될 때까지)
+        motor1.move_to_position_mm(0)
+        motor2.move_to_position_mm(0)
+
         print("모터 이동 중...")
-        time.sleep(0.2)  # 명령 처리 대기
+        time.sleep(0.2)
 
         start_time = time.monotonic()
-        while motor1.is_moving():  # 2개 모터 사용 시: motor1.is_moving() or motor2.is_moving()
-            print(f"--> 이동 중... M1: {motor1.current_position_mm:.2f} mm", end='\r')
+        while motor1.is_moving() or motor2.is_moving():
+            print(f"--> 이동 중... M1: {motor1.current_position_mm:.2f}mm, M2: {motor2.current_position_mm:.2f}mm", end='\r')
             time.sleep(0.05)
 
             if time.monotonic() - start_time > 60:
                 print("\n[경고] 타임아웃: 60초 내에 이동이 완료되지 않았습니다.")
                 break
 
-        print(f"\n--> 이동 완료! M1: {motor1.current_position_mm:.2f} mm")
+        print(f"\n--> 이동 완료! M1: {motor1.current_position_mm:.2f}mm, M2: {motor2.current_position_mm:.2f}mm")
+        print(f"    위치 차이: {abs(motor1.current_position_mm - motor2.current_position_mm):.3f}mm")
 
         print("\n[완료] 이동 완료!")
         time.sleep(1)
@@ -135,25 +147,25 @@ def main():
         print("\n--- 원점 복귀 시작 (CSP 모드) ---")
         # 원점 복귀 명령을 보냅니다.
         motor1.move_to_position_mm(0)
-        # motor2.move_to_position_mm(0)  # 2개 모터 사용 시 주석 해제
+        motor2.move_to_position_mm(0)
 
-        # 이동이 완료될 때까지 대기
         print("모터 복귀 중...")
-        time.sleep(0.2)  # 명령 처리 대기
+        time.sleep(0.2)
 
         start_time = time.monotonic()
-        while motor1.is_moving():  # 2개 모터 사용 시: motor1.is_moving() or motor2.is_moving()
-            print(f"--> 복귀 중... M1: {motor1.current_position_mm:.2f} mm", end='\r')
+        while motor1.is_moving() or motor2.is_moving():
+            print(f"--> 복귀 중... M1: {motor1.current_position_mm:.2f}mm, M2: {motor2.current_position_mm:.2f}mm", end='\r')
             time.sleep(0.05)
 
             if time.monotonic() - start_time > 60:
                 print("\n[경고] 타임아웃: 60초 내에 복귀가 완료되지 않았습니다.")
                 break
 
-        print(f"\n--> 복귀 완료! M1: {motor1.current_position_mm:.2f} mm")
-        print(f"[디버그] 최종 펄스 - M1: {motor1.current_position_pulse}")
-        print(f"[디버그] 오프셋 펄스 - M1: {motor1.offset_pulse}")
-        print(f"[디버그] 상대 펄스 - M1: {motor1.current_position_pulse - motor1.offset_pulse}")
+        print(f"\n--> 복귀 완료! M1: {motor1.current_position_mm:.2f}mm, M2: {motor2.current_position_mm:.2f}mm")
+        print(f"    위치 차이: {abs(motor1.current_position_mm - motor2.current_position_mm):.3f}mm")
+        print(f"[디버그] 최종 펄스   - M1: {motor1.current_position_pulse}, M2: {motor2.current_position_pulse}")
+        print(f"[디버그] 오프셋 펄스 - M1: {motor1.offset_pulse}, M2: {motor2.offset_pulse}")
+        print(f"[디버그] 상대 펄스   - M1: {motor1.current_position_pulse - motor1.offset_pulse}, M2: {motor2.current_position_pulse - motor2.offset_pulse}")
 
         print("\n[완료] 원점 복귀 완료!")
         print("\n--- 모든 작업 완료 ---")

@@ -1,6 +1,22 @@
+"""
+motor_coupling.py - Cross Coupling 기능이 추가된 모터 제어 라이브러리
+
+변경 사항 (motor_safe.py 대비):
+1. Cross Coupling 알고리즘 추가
+2. 게인(Kc) 파라미터로 보정 강도 조절
+3. 런타임 중 Cross Coupling 활성화/비활성화 가능
+4. 런타임 중 게인 조절 가능
+
+Cross Coupling 원리:
+- 두 모터의 상대 위치 차이를 계산
+- 평균 위치에서 벗어난 정도를 보정량으로 사용
+- 앞서가는 모터는 감속, 뒤처지는 모터는 가속
+"""
+
 import pysoem
 import struct
 import time
+import math
 import multiprocessing as mp
 from typing import List
 
@@ -15,29 +31,43 @@ PULSES_PER_REVOLUTION = 8388608
 x_axis_mm_per_rev = 11.9993131404
 z_axis_mm_per_rev = 5.99965657019
 
-def _ethercat_process_loop(
+# --- 안전 및 Cross Coupling 관련 상수 ---
+DEFAULT_MAX_SYNC_ERROR_MM = 0.5  # 기본 허용 동기화 오차 (mm)
+DEFAULT_COUPLING_GAIN = 0.1     # 기본 Cross Coupling 게인 (0.0 ~ 1.0)
+
+
+def _ethercat_process_loop_coupling(
     adapter_name, num_slaves, cycle_time_s,
-    command_queue, shared_states, lock
+    command_queue, shared_states, lock,
+    max_sync_error_pulse,
+    coupling_params  # 추가: Cross Coupling 파라미터 공유
 ):
     """
-    별도의 프로세스에서 실행될 단일 EtherCAT 통신 및 제어 루프.
-    모든 슬레이브를 관리합니다.
+    [COUPLING 버전] 별도의 프로세스에서 실행될 EtherCAT 통신 및 제어 루프.
+    Cross Coupling 및 위치 모니터링 기능 포함.
     """
+    # --- [지터 감소] 프로세스 우선순위 상승 ---
+    try:
+        import psutil, os
+        psutil.Process(os.getpid()).nice(psutil.HIGH_PRIORITY_CLASS)
+        print("[DC] 프로세스 우선순위: HIGH (사이클 지터 감소)")
+    except Exception as e:
+        print(f"[DC] 우선순위 설정 실패 (관리자 권한 필요): {e}")
+
     master = pysoem.Master()
 
-    # 모든 모터의 축을 'x'로 초기화합니다.
-    # CSP 모드: target_pulse은 현재 목표 위치, trajectory는 이동 궤적 정보를 저장
     local_motor_states = [{
-        'target_pulse': 0,  # 현재 목표 위치 (CSP에서는 매 사이클 업데이트)
-        'offset': 0,        # 원점 오프셋
-        'mode': 'csp',      # CSP 모드로 변경
-        'axis': 'x',        # 축 설정
-        'trajectory': None  # 궤적 정보: {'start': pulse, 'end': pulse, 'duration': sec, 'start_time': time}
+        'target_pulse': 0,
+        'offset': 0,
+        'mode': 'csp',
+        'axis': 'x',
+        'trajectory': None
     } for _ in range(num_slaves)]
 
     is_running = True
+    sync_error_detected = False
 
-    # [먼저] 큐에서 모든 설정 명령을 미리 읽어서 저장 (재시도 시에도 유지되도록)
+    # 큐에서 설정 명령 읽기
     slave_configs = {i: {} for i in range(num_slaves)}
     while not command_queue.empty():
         slave_idx, cmd, value = command_queue.get_nowait()
@@ -46,11 +76,10 @@ def _ethercat_process_loop(
         elif cmd == 'SET_ACCEL':
             slave_configs[slave_idx]['accel'] = value
         elif cmd == 'SET_AXIS':
-            # 축 설정도 미리 적용
             local_motor_states[slave_idx]['axis'] = value
             print(f"[초기화] 모터 {slave_idx} 축을 '{value}'로 설정")
 
-    # --- EtherCAT 초기화 재시도 로직 ---
+    # --- EtherCAT 초기화 ---
     max_init_retries = 3
     init_success = False
 
@@ -62,10 +91,9 @@ def _ethercat_process_loop(
                     master.close()
                 except:
                     pass
-                time.sleep(1.0)  # 재시도 전 대기
-                master = pysoem.Master()  # 새 마스터 인스턴스 생성
+                time.sleep(1.0)
+                master = pysoem.Master()
 
-            # --- EtherCAT 초기화 ---
             print("[초기화] EtherCAT 어댑터 열기...")
             master.open(adapter_name)
 
@@ -79,10 +107,14 @@ def _ethercat_process_loop(
                 slave = master.slaves[i]
                 print(f"[연결] Slave {i}: {slave.name}")
 
-                slave.dc_sync(True, int(cycle_time_s * 1_000_000_000))
+                # DC Sync: SYNC0 주기 설정 + shift 오프셋
+                # shift = 사이클의 20% → 마스터 지터(±1~2ms)가 있어도
+                # 드라이브가 SYNC0 이전에 PDO를 안정적으로 수신
+                sync0_ns  = int(cycle_time_s * 1_000_000_000)
+                shift_ns  = sync0_ns // 5
+                slave.dc_sync(True, sync0_ns, shift_ns)
                 _sdo_reset_fault(slave)
 
-                # [중요] PDO 설정 전에 속도/가감속 설정 적용
                 if 'velocity' in slave_configs[i]:
                     print(f"  모터 {i}에 대한 SDO 설정 적용 중... (Velocity)")
                     velocity_pulse_per_sec = _rpm_to_pulse_per_sec(slave_configs[i]['velocity'])
@@ -93,27 +125,12 @@ def _ethercat_process_loop(
                     slave.sdo_write(0x6083, 0, struct.pack("<I", accel_val))
                     slave.sdo_write(0x6084, 0, struct.pack("<I", decel_val))
 
-                _configure_csp_pdos(slave)  # CSP 모드 PDO 설정
-                _setup_csp_mode(slave)      # CSP 모드 설정
+                _configure_csp_pdos(slave)
+                _setup_csp_mode(slave)
 
-                # [디버그] 현재 설정 읽기 및 설정 변경
                 try:
-                    # Position Window 읽기 및 설정
-                    pos_window = struct.unpack("<I", slave.sdo_read(0x6067, 0))[0]
-                    print(f"  [디버그] 현재 Position Window: {pos_window} pulses")
-                    # CSP 모드에서는 Position Window를 매우 크게 설정
-                    # 0xFFFFFFFF는 드라이버가 거부할 수 있으므로 200M pulse (약 143mm) 사용
                     slave.sdo_write(0x6067, 0, struct.pack("<I", 200000000))
-                    print(f"  [설정] Position Window를 200000000 펄스 (약 143mm)로 설정")
-
-                    # Following Error Window 읽기 및 설정 (핵심!)
-                    following_error = struct.unpack("<I", slave.sdo_read(0x6065, 0))[0]
-                    print(f"  [디버그] 현재 Following Error Window: {following_error} pulses")
-                    # CSP 모드에서는 Following Error Window를 매우 크게 설정
-                    # 0xFFFFFFFF는 드라이버가 거부할 수 있으므로 200M pulse (약 143mm) 사용
                     slave.sdo_write(0x6065, 0, struct.pack("<I", 200000000))
-                    print(f"  [설정] Following Error Window를 200000000 펄스 (약 143mm)로 설정")
-
                     time.sleep(0.01)
                 except Exception as e:
                     print(f"  [경고] SDO 윈도우 설정 실패 (계속 진행): {e}")
@@ -122,14 +139,17 @@ def _ethercat_process_loop(
             pdo_size = master.config_map()
             print(f"[성공] PDO 맵핑 완료. Process data size: {pdo_size} bytes")
 
-            # 초기화 성공!
+            # [안전 모드 + Cross Coupling] 정보 출력
+            print(f"[안전 모드] 동기화 오차 임계값: {max_sync_error_pulse} pulse")
+            print(f"[Cross Coupling] 초기 게인: {coupling_params[0]:.2f}")
+
             init_success = True
             break
 
         except Exception as e:
             print(f"[에러] EtherCAT 초기화 실패: {e}")
             if retry_count < max_init_retries - 1:
-                print(f"  → {1.0}초 후 재시도합니다...")
+                print(f"  → 1.0초 후 재시도합니다...")
             else:
                 print(f"  → {max_init_retries}회 시도 후 실패. 프로그램을 종료합니다.")
                 try:
@@ -143,7 +163,7 @@ def _ethercat_process_loop(
         return
 
     try:
-        # --- OP 상태로 전환 (재시도 로직 포함) ---
+        # --- OP 상태로 전환 ---
         max_op_retries = 3
         op_success = False
 
@@ -157,7 +177,6 @@ def _ethercat_process_loop(
                 master.state = pysoem.OP_STATE
                 master.write_state()
 
-                # OP 상태 도달을 위한 올바른 대기 루프
                 is_op = False
                 for _ in range(int(4.0 / cycle_time_s)):
                     master.send_processdata()
@@ -173,8 +192,6 @@ def _ethercat_process_loop(
 
                 print("[성공] OP 상태 도달 성공! 주기 통신을 시작합니다.")
 
-                # [CSP 모드 중요!] OP 상태 직후 현재 위치로 target_pulse 초기화
-                # 이렇게 하지 않으면 0 위치로 가려고 시도하면서 Following Error 발생
                 for i in range(num_slaves):
                     current_pos = _read_actual_position(master.slaves[i])
                     local_motor_states[i]['target_pulse'] = current_pos
@@ -188,7 +205,6 @@ def _ethercat_process_loop(
                 if op_retry < max_op_retries - 1:
                     print(f"  → 0.5초 후 재시도합니다...")
                 else:
-                    print(f"  → {max_op_retries}회 시도 후 실패. 프로그램을 종료합니다.")
                     raise
 
         if not op_success:
@@ -196,23 +212,24 @@ def _ethercat_process_loop(
 
         # --- 메인 제어 루프 ---
         cycle_counter = 0
+        # 절대 시각 기반 타이밍: 지터가 누적되지 않도록 다음 사이클 기준 시각을 고정
+        next_cycle_time = time.monotonic() + cycle_time_s
         while is_running:
-            loop_start_time = time.monotonic()
             cycle_counter += 1
 
-            # 1. 메인 프로세스로부터 명령 수신
-            # [중요] 동기화를 위해 이번 사이클에서 받은 모든 MOVE 명령은 같은 start_time 사용
+            # Cross Coupling 파라미터 읽기 (런타임 변경 가능)
+            coupling_enabled = coupling_params[1] != 0
+            coupling_gain = coupling_params[0]
+
+            # 1. 명령 수신
             trajectory_commands = []
 
             while not command_queue.empty():
-
-                slave_idx, cmd, value = command_queue.get_nowait() 
-                ## QES1: 큐 원소 의미 ---------------------
-
+                slave_idx, cmd, value = command_queue.get_nowait()
                 if cmd == 'STOP_ALL':
                     # ── CiA 402 종료 시퀀스 (EtherCAT 통신이 살아있는 동안 실행) ──
-                    # finally 블록에서 실행하면 워치독이 이미 OP→SAFEOP 전환한 후라
-                    # 슬레이브가 제어워드를 무시함. 루프 내부에서 처리해야 함.
+                    # finally 블록에서 실행하면 EtherCAT 워치독이 이미 OP→SAFEOP으로
+                    # 전환한 후라 슬레이브가 제어워드를 무시함. 루프 내부에서 처리해야 함.
                     print("\n[종료] CiA 402 종료 시퀀스 시작...")
 
                     def _shutdown_cycles(cw_value, n_cycles):
@@ -230,74 +247,56 @@ def _ethercat_process_loop(
                             time.sleep(cycle_time_s)
 
                     print("  1단계: Disable Operation (Op Enabled → Switched On)")
-                    _shutdown_cycles(CW_SWITCH_ON, 10)        # 10 × cycle = 100ms
+                    _shutdown_cycles(CW_SWITCH_ON, 10)        # 10 × 10ms = 100ms
 
                     print("  2단계: Shutdown (Switched On → Ready To Switch On)")
-                    _shutdown_cycles(CW_SHUTDOWN, 5)          # 5 × cycle = 50ms
+                    _shutdown_cycles(CW_SHUTDOWN, 5)          # 5 × 10ms = 50ms
 
                     print("  3단계: Disable Voltage (Ready To Switch On → Switch On Disabled)")
-                    _shutdown_cycles(CW_DISABLE_VOLTAGE, 5)   # 5 × cycle = 50ms
+                    _shutdown_cycles(CW_DISABLE_VOLTAGE, 5)   # 5 × 10ms = 50ms
 
-                    print("  [완료] CiA 402 종료 시퀀스 완료")
+                    print("  [완료] CiA 402 종료 시퀀스 완료 (드라이버 LED off 확인)")
                     is_running = False
                     break
                 elif cmd == 'SET_AXIS':
                     local_motor_states[slave_idx]['axis'] = value
                 elif cmd == 'SET_ORIGIN':
-                    ## QES2: 원점 설정 동작 내용 ------------------
-
-                    # [중요] 원점 설정 시 현재 위치를 정확히 읽어서 offset에 저장
-                    # PDO 통신 직후의 최신 위치를 사용
                     current_pos = _read_actual_position(master.slaves[slave_idx])
                     local_motor_states[slave_idx]['offset'] = current_pos
-                    # target_pulse도 현재 위치로 설정하여 즉시 정지 상태 유지
                     local_motor_states[slave_idx]['target_pulse'] = current_pos
-                    print(f"[디버그] 모터 {slave_idx} 원점 설정: offset={current_pos}, target={current_pos}")
+                    sync_error_detected = False
+                    print(f"[디버그] 모터 {slave_idx} 원점 설정: offset={current_pos}")
                 elif cmd == 'MOVE_TO_MM':
-                    # 이동 명령은 일단 저장만 하고 나중에 일괄 처리
-                    trajectory_commands.append((slave_idx, value))
+                    if sync_error_detected:
+                        print(f"[경고] 동기화 오류 상태! 모터 {slave_idx} 이동 명령 무시됨")
+                    else:
+                        trajectory_commands.append((slave_idx, value))
+                elif cmd == 'RESET_SYNC_ERROR':
+                    sync_error_detected = False
+                    print("[안전] 동기화 오류 플래그 리셋")
 
-            # [CSP 동기화 핵심] 모든 이동 명령을 같은 start_time으로 처리
-            if trajectory_commands:
-                # [중요] 새 명령이 들어오면 기존 궤적을 모두 취소
-                # 이렇게 하지 않으면 이전 궤적이 완료될 때까지 새 명령이 무시됨
+            # 궤적 처리
+            if trajectory_commands and not sync_error_detected:
                 for slave_idx, _ in trajectory_commands:
                     if local_motor_states[slave_idx]['trajectory'] is not None:
                         print(f"[경고] 모터 {slave_idx}: 기존 궤적 취소 후 새 명령 처리")
                         local_motor_states[slave_idx]['trajectory'] = None
 
-                # 다음 사이클 시작 시간을 공통 궤적 시작 시간으로 사용
                 common_start_time = time.monotonic()
 
-                # [1단계] 모든 모터의 이동 거리와 시간을 계산
                 trajectory_data = []
                 for slave_idx, target_mm in trajectory_commands:
                     state = local_motor_states[slave_idx]
                     mm_per_rev = x_axis_mm_per_rev if state['axis'] == 'x' else z_axis_mm_per_rev
                     revolutions = target_mm / mm_per_rev
-
-                    # [중요] Position Factor 2:1 처리
-                    # 모든 값을 드라이버 스케일(2배)로 통일
-                    # offset, current_pos는 드라이버에서 읽으므로 이미 2배
-                    # target도 2배로 계산해야 함
                     target_pulse_relative = int(revolutions * PULSES_PER_REVOLUTION * 2)
                     target_pulse_absolute = target_pulse_relative + state['offset']
 
                     current_pos = _read_actual_position(master.slaves[slave_idx])
                     distance = abs(target_pulse_absolute - current_pos)
 
-                    # [디버그] 이동 명령 계산 과정 출력
-                    print(f"[계산] 모터 {slave_idx} 이동 명령:")
-                    print(f"  입력: target_mm={target_mm:.2f}mm, axis={state['axis']}")
-                    print(f"  회전수: {revolutions:.4f} rev")
-                    print(f"  상대 펄스: {target_pulse_relative}")
-                    print(f"  offset: {state['offset']}")
-                    print(f"  절대 목표: {target_pulse_absolute}")
-                    print(f"  현재 위치: {current_pos}")
-                    print(f"  이동 거리: {distance} pulse")
+                    print(f"[계산] 모터 {slave_idx} 이동 명령: {target_mm:.2f}mm")
 
-                    # [수정] 설정된 속도 사용 (하드코딩하지 않음)
-                    # slave_configs에서 설정된 velocity가 있으면 사용, 없으면 기본값 60 RPM
                     configured_velocity = slave_configs.get(slave_idx, {}).get('velocity', 60)
                     velocity_pulse_per_sec = (configured_velocity / 60.0) * PULSES_PER_REVOLUTION * 2
                     duration = distance / velocity_pulse_per_sec if velocity_pulse_per_sec > 0 else 1.0
@@ -305,48 +304,108 @@ def _ethercat_process_loop(
                     trajectory_data.append({
                         'slave_idx': slave_idx,
                         'target_mm': target_mm,
-                        'revolutions': revolutions,
                         'current_pos': current_pos,
                         'target_pos': target_pulse_absolute,
                         'distance': distance,
                         'duration': duration
                     })
 
-                # [2단계] 가장 긴 duration 사용 (모든 모터가 같은 시간에 완료)
                 max_duration = max(max(traj['duration'] for traj in trajectory_data), 0.1)
 
-                # [3단계 - 핵심!] 각 모터는 자신의 목표로 이동하되, 같은 시간에 완료
-                # 거리를 강제로 맞추지 않음 - 각자의 목표 위치 사용!
                 for traj_info in trajectory_data:
                     slave_idx = traj_info['slave_idx']
                     state = local_motor_states[slave_idx]
-
-                    # 각 모터가 원래 목표 위치로 이동
-                    # 하지만 모두 같은 시간(max_duration)에 도착
                     state['trajectory'] = {
                         'start': traj_info['current_pos'],
-                        'end': traj_info['target_pos'],  # 원래 목표 그대로 사용!
-                        'duration': max_duration,        # 시간만 동기화!
+                        'end': traj_info['target_pos'],
+                        'duration': max_duration,
                         'start_time': common_start_time
                     }
-                    print(f"[디버그] 모터 {slave_idx} CSP 궤적 생성:")
-                    print(f"  목표: {traj_info['target_mm']:.2f}mm")
-                    print(f"  현재: {traj_info['current_pos']} → 목표: {traj_info['target_pos']}")
-                    print(f"  이동거리: {traj_info['distance']} pulse, 시간: {max_duration:.2f}초")
+                    print(f"[궤적] 모터 {slave_idx}: {traj_info['target_mm']:.2f}mm, 시간: {max_duration:.2f}초")
 
-            if not is_running: break
+            if not is_running:
+                break
 
-            ### 1. 메인 프로세스로부터 명령 수신 종료
-
-
-
-
-            # 2. EtherCAT PDO 통신 (모든 슬레이브에 대해 한번에)
+            # 2. PDO 통신
             master.send_processdata()
             master.receive_processdata()
 
-            # 3. 각 슬레이브 상태 업데이트 및 제어
-            # [안전장치] 먼저 모든 모터의 Fault 상태를 확인
+            # 모든 모터의 실제 위치 읽기
+            positions = [_read_actual_position(master.slaves[i]) for i in range(num_slaves)]
+
+            # 오프셋 보정된 상대 위치 계산
+            relative_positions = [
+                positions[i] - local_motor_states[i]['offset']
+                for i in range(num_slaves)
+            ]
+
+            # 이동 중인 모터가 있는지 확인
+            all_moving = all(
+                local_motor_states[i]['trajectory'] is not None
+                for i in range(num_slaves)
+            )
+            any_moving = any(
+                local_motor_states[i]['trajectory'] is not None
+                for i in range(num_slaves)
+            )
+
+            # ========================================
+            # [안전 기능] 다축 위치 차이 모니터링
+            # ========================================
+            if num_slaves >= 2 and not sync_error_detected and any_moving:
+                for i in range(num_slaves - 1):
+                    position_diff = abs(relative_positions[i] - relative_positions[i + 1])
+
+                    if position_diff > max_sync_error_pulse:
+                        sync_error_detected = True
+                        diff_mm = position_diff / (PULSES_PER_REVOLUTION * 2) * z_axis_mm_per_rev
+
+                        print(f"\n{'='*60}")
+                        print(f"[긴급 정지] 동기화 오차 초과!")
+                        print(f"  Motor {i} vs Motor {i+1}")
+                        print(f"  위치 차이: {position_diff} pulse ({diff_mm:.3f} mm)")
+                        print(f"  임계값: {max_sync_error_pulse} pulse")
+                        print(f"{'='*60}")
+
+                        for j in range(num_slaves):
+                            if local_motor_states[j]['trajectory'] is not None:
+                                local_motor_states[j]['trajectory'] = None
+                                current_pos = positions[j]
+                                local_motor_states[j]['target_pulse'] = current_pos
+                                print(f"  → 모터 {j} 긴급 정지: {current_pos} pulse에 고정")
+                        break
+
+            # ========================================
+            # [Cross Coupling] 위치 오차 보정
+            # ========================================
+            coupling_correction = [0] * num_slaves
+
+            if coupling_enabled and num_slaves >= 2 and all_moving and not sync_error_detected:
+                # 평균 상대 위치 계산
+                avg_relative_position = sum(relative_positions) / num_slaves
+
+                for i in range(num_slaves):
+                    # 각 모터의 평균 위치로부터의 오차
+                    error_from_avg = relative_positions[i] - avg_relative_position
+
+                    # 게인 적용하여 보정량 계산
+                    # 앞서가면 (error > 0) → 보정량 양수 → 목표에서 차감 → 감속 효과
+                    # 뒤처지면 (error < 0) → 보정량 음수 → 목표에서 차감 → 가속 효과
+                    coupling_correction[i] = int(coupling_gain * error_from_avg)
+
+                # 디버그 출력 (매 50 사이클마다)
+                if cycle_counter % 50 == 0:
+                    print(f"[Cross Coupling] 상대위치: {[int(p) for p in relative_positions]}")
+                    print(f"  평균: {int(avg_relative_position)}, 보정량: {coupling_correction}")
+
+            # 동기화 모니터링 디버그 출력
+            if cycle_counter % 50 == 0 and any_moving and num_slaves >= 2:
+                for i in range(num_slaves - 1):
+                    diff = abs(relative_positions[i] - relative_positions[i + 1])
+                    diff_mm = diff / (PULSES_PER_REVOLUTION * 2) * z_axis_mm_per_rev
+                    print(f"[동기화] M{i}-M{i+1} 위치차: {diff} pulse ({diff_mm:.3f}mm)")
+
+            # 3. Fault 확인
             fault_detected = False
             fault_motor_id = -1
             for i in range(num_slaves):
@@ -356,111 +415,89 @@ def _ethercat_process_loop(
                     fault_motor_id = i
                     break
 
-            # [연동 안전] 한 모터라도 Fault 발생 시 모든 모터 즉시 정지
             if fault_detected:
-                print(f"\n[긴급 정지] 모터 {fault_motor_id} Fault 감지! 모든 모터를 안전하게 정지합니다.")
+                print(f"\n[긴급 정지] 모터 {fault_motor_id} Fault 감지!")
                 for i in range(num_slaves):
                     if local_motor_states[i]['trajectory'] is not None:
                         local_motor_states[i]['trajectory'] = None
                         current_pos = _read_actual_position(master.slaves[i])
                         local_motor_states[i]['target_pulse'] = current_pos
-                        print(f"  → 모터 {i} 정지: 위치 {current_pos} pulse에 고정")
+                        print(f"  → 모터 {i} 정지: {current_pos} pulse에 고정")
 
+            # 4. 각 슬레이브 제어
             for i in range(num_slaves):
                 slave = master.slaves[i]
                 state = local_motor_states[i]
 
                 status = _read_status_word(slave)
 
-                # [디버그] 상태 변화 감지 (이전 상태와 다를 때만 출력)
                 if 'last_status' not in state:
                     state['last_status'] = 0
                 if state['last_status'] != status:
-                    # 궤적이 있거나 Fault 상태면 출력
                     if state['trajectory'] is not None or (status & 0x0008):
-                        print(f"[상태] 모터 {i} 상태 변화: 0x{state['last_status']:04X} → 0x{status:04X}")
+                        print(f"[상태] 모터 {i}: 0x{state['last_status']:04X} → 0x{status:04X}")
                     state['last_status'] = status
 
-                # CiA 402 상태 머신 - CSP 모드에서도 동일하게 적용
                 cw = 0
-                if (status & 0x004F) == 0x0040:      # Switch On Disabled
+                if (status & 0x004F) == 0x0040:
                     cw = CW_SHUTDOWN
-                elif (status & 0x006F) == 0x0021:    # Ready to Switch On
+                elif (status & 0x006F) == 0x0021:
                     cw = CW_SWITCH_ON
-                elif (status & 0x006F) == 0x0023:    # Switched On
+                elif (status & 0x006F) == 0x0023:
                     cw = CW_ENABLE_OPERATION
-                elif (status & 0x006F) == 0x0027:    # Operation Enabled
+                elif (status & 0x006F) == 0x0027:
                     cw = CW_ENABLE_OPERATION
-                elif (status & 0x0008):               # Fault
+                elif (status & 0x0008):
                     cw = CW_FAULT_RESET
-                    if cycle_counter % 50 == 0:  # Fault는 자주 출력
+                    if cycle_counter % 50 == 0:
                         print(f"[경고] 모터 {i} Fault 상태! status=0x{status:04X}")
                 else:
                     cw = CW_ENABLE_OPERATION
 
-                # [CSP 모드] 궤적 보간 로직
                 target_position = state['target_pulse']
 
                 if state['trajectory'] is not None:
                     traj = state['trajectory']
                     elapsed = time.monotonic() - traj['start_time']
                     current_actual_pos = _read_actual_position(slave)
-
-                    # [핵심 수정] 위치 기반 완료 판정
-                    # Position Factor 2:1 고려하여 threshold를 50000으로 설정 (약 0.18mm)
                     position_error = abs(traj['end'] - current_actual_pos)
 
-                    # [안전장치] 위치 오차가 Following Error Window를 초과하면 궤적 취소
-                    # Following Error Window는 20M pulse
-                    # 이 값은 이동 중 허용되는 최대 추종 오차이므로, 여기서는 비활성화
-                    # (초기 위치 오차는 목표까지의 거리이므로 항상 큼)
-                    # 대신 드라이버가 Following Error를 자동으로 감지하므로 여기서는 확인만
-                    if False and position_error > 18000000:  # 비활성화
-                        print(f"[에러] 모터 {i} 위치 오차 과다! ({position_error} pulse)")
-                        print(f"  목표: {traj['end']}, 현재: {current_actual_pos}, offset: {state['offset']}")
-                        print(f"  궤적을 취소하고 현재 위치에 고정합니다.")
-                        state['trajectory'] = None
-                        state['target_pulse'] = current_actual_pos
-                        target_position = current_actual_pos
-                    # [중요] 위치 기반 완료만 사용 - 시간 기반은 싱크 위험
-                    elif position_error < 50000:
-                        # 목표 위치 도달 - 정확히 최종 위치로 설정
+                    if position_error < 50000:
                         target_position = traj['end']
                         state['target_pulse'] = traj['end']
-                        state['trajectory'] = None  # 궤적 완료
-                        print(f"[완료] 모터 {i} 궤적 완료! 최종 위치오차: {position_error} pulse")
+                        state['trajectory'] = None
+                        print(f"[완료] 모터 {i} 궤적 완료! 위치오차: {position_error} pulse")
                     else:
-                        # [디버그] 위치 오차 출력 (매 10 사이클마다)
-                        if cycle_counter % 10 == 0:
-                            print(f"[디버그] 모터 {i} 위치오차: {position_error} pulse, 목표: {traj['end']}, 현재: {current_actual_pos}")
-
-                        # S-Curve 보간으로 부드러운 가감속
-                        progress = min(elapsed / traj['duration'], 1.0)  # 1.0을 초과하지 않도록
-
-                        # S-curve 공식: smooth_progress = (1 - cos(π * progress)) / 2
-                        import math
+                        progress = min(elapsed / traj['duration'], 1.0)
                         smooth_progress = (1.0 - math.cos(math.pi * progress)) / 2.0
-
-                        # 목표 위치 계산 - S-Curve 기반
                         target_position = int(traj['start'] + (traj['end'] - traj['start']) * smooth_progress)
+
+                        # ========================================
+                        # [Cross Coupling 적용] 목표 위치 보정
+                        # ========================================
+                        target_position -= coupling_correction[i]
+
                         state['target_pulse'] = target_position
 
                 _write_csp_outputs(slave, cw, target_position)
 
-                # 4. 상태를 메인 프로세스와 공유
+                # 5. 상태 공유 (sync_error 상태 포함)
                 with lock:
-                    base_idx = i * 4
+                    base_idx = i * 5
                     shared_states[base_idx] = status
-                    # CSP 모드: trajectory가 있으면 1 (이동 중), 없으면 0 (정지)
                     shared_states[base_idx + 1] = 1 if state['trajectory'] is not None else 0
                     current_pos = _read_actual_position(slave)
                     shared_states[base_idx + 2] = current_pos
                     shared_states[base_idx + 3] = state['offset']
+                    shared_states[base_idx + 4] = 1 if sync_error_detected else 0
 
-            # 5. 사이클 타임 유지
-            loop_duration = time.monotonic() - loop_start_time
-            sleep_time = cycle_time_s - loop_duration
-            if sleep_time > 0: time.sleep(sleep_time)
+            # 6. 사이클 타임 유지 (절대 시각 기반 - 지터 누적 방지)
+            # 상대 sleep: 루프 실행 시간만큼 sleep이 짧아져 지터 누적
+            # 절대 sleep: 다음 사이클 기준 시각까지 대기 → 지터 누적 없음
+            sleep_time = next_cycle_time - time.monotonic()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            next_cycle_time += cycle_time_s
 
     except Exception as e:
         print(f"EtherCAT 프로세스 에러: {e}")
@@ -477,18 +514,15 @@ def _ethercat_process_loop(
             master.close()
             print("EtherCAT 프로세스 종료.\n")
 
-# --- 프로세스 내부 헬퍼 함수들 ---
+
+# --- 헬퍼 함수들 ---
 def _read_status_word(slave):
     return struct.unpack("<H", slave.input[:2])[0]
-
-def _read_op_mode(slave):
-    return struct.unpack("<b", slave.input[2:3])[0]
 
 def _read_actual_position(slave):
     return struct.unpack("<i", slave.input[2:6])[0]
 
 def _write_csp_outputs(slave, cw, target_position):
-    """CSP 모드용 출력 함수 - Controlword와 Target Position만 전송"""
     slave.output = struct.pack("<H", cw) + struct.pack("<i", target_position)
 
 def _rpm_to_pulse_per_sec(rpm):
@@ -500,65 +534,91 @@ def _sdo_reset_fault(slave):
         time.sleep(0.2)
 
 def _setup_csp_mode(slave):
-    """CSP 모드 설정 (Cyclic Synchronous Position Mode = 8)"""
-    # 0x211F: 드라이버 특수 설정 (비트 12: 절대 위치 모드, 비트 4: 새 명령 허용)
-    # CSP에서는 비트 4가 필요 없지만 드라이버 호환성을 위해 유지
     slave.sdo_write(0x211F, 0, struct.pack("<H", (1 << 12)))
     time.sleep(0.01)
-    # 0x6060: Modes of Operation - 8 = CSP
     slave.sdo_write(0x6060, 0, struct.pack("<b", 8))
     time.sleep(0.01)
     print(f"  [설정] CSP 모드(8) 설정 완료")
 
 def _configure_csp_pdos(slave):
-    """CSP 모드용 PDO 매핑 설정"""
-    # RxPDO (Master -> Slave): Controlword + Target Position
     slave.sdo_write(0x1C12, 0, b'\x00'); time.sleep(0.01)
     slave.sdo_write(0x1600, 0, b'\x00'); time.sleep(0.01)
-    slave.sdo_write(0x1600, 1, struct.pack('<I', 0x60400010)); time.sleep(0.01)  # Controlword (2 bytes)
-    slave.sdo_write(0x1600, 2, struct.pack('<I', 0x607A0020)); time.sleep(0.01)  # Target Position (4 bytes)
+    slave.sdo_write(0x1600, 1, struct.pack('<I', 0x60400010)); time.sleep(0.01)
+    slave.sdo_write(0x1600, 2, struct.pack('<I', 0x607A0020)); time.sleep(0.01)
     slave.sdo_write(0x1600, 0, b'\x02'); time.sleep(0.01)
     slave.sdo_write(0x1C12, 1, struct.pack('<H', 0x1600)); time.sleep(0.01)
     slave.sdo_write(0x1C12, 0, b'\x01'); time.sleep(0.01)
 
-    # TxPDO (Slave -> Master): Statusword + Position Actual Value
     slave.sdo_write(0x1C13, 0, b'\x00'); time.sleep(0.01)
     slave.sdo_write(0x1A00, 0, b'\x00'); time.sleep(0.01)
-    slave.sdo_write(0x1A00, 1, struct.pack('<I', 0x60410010)); time.sleep(0.01)  # Statusword (2 bytes)
-    slave.sdo_write(0x1A00, 2, struct.pack('<I', 0x60640020)); time.sleep(0.01)  # Position actual value (4 bytes)
+    slave.sdo_write(0x1A00, 1, struct.pack('<I', 0x60410010)); time.sleep(0.01)
+    slave.sdo_write(0x1A00, 2, struct.pack('<I', 0x60640020)); time.sleep(0.01)
     slave.sdo_write(0x1A00, 0, b'\x02'); time.sleep(0.01)
     slave.sdo_write(0x1C13, 1, struct.pack('<H', 0x1A00)); time.sleep(0.01)
     slave.sdo_write(0x1C13, 0, b'\x01'); time.sleep(0.01)
     print(f"  [설정] CSP PDO 매핑 완료")
 
-# --- 메인 프로세스에서 사용할 클래스들 ---
-class EtherCATBus:
-    def __init__(self, adapter_name: str, num_slaves: int, cycle_time_ms: int = 50):
+
+# --- 메인 클래스들 ---
+class EtherCATBusCoupling:
+    """
+    [COUPLING 버전] EtherCAT 버스 관리 클래스
+
+    추가 기능:
+    - max_sync_error_mm: 허용 동기화 오차 (mm 단위, 기본 0.5mm)
+    - coupling_gain: Cross Coupling 게인 (0.0 ~ 1.0, 기본 0.1)
+    - enable_coupling: Cross Coupling 활성화 여부 (기본 True)
+    """
+
+    def __init__(self, adapter_name: str, num_slaves: int, cycle_time_ms: int = 50,
+                 max_sync_error_mm: float = DEFAULT_MAX_SYNC_ERROR_MM,
+                 coupling_gain: float = DEFAULT_COUPLING_GAIN,
+                 enable_coupling: bool = True):
         self._command_queue = mp.Queue()
         self._lock = mp.Lock()
-        # 각 슬레이브당 status_word, move_state, position_pulse, offset_pulse 4개의 상태를 저장
-        self._shared_states = mp.Array('d', num_slaves * 4, lock=False)
-        
+        self._shared_states = mp.Array('d', num_slaves * 5, lock=False)
+
+        # Cross Coupling 파라미터 (프로세스 간 공유)
+        # [0]: coupling_gain, [1]: enable_coupling (0 or 1)
+        self._coupling_params = mp.Array('d', 2, lock=True)
+        self._coupling_params[0] = coupling_gain
+        self._coupling_params[1] = 1.0 if enable_coupling else 0.0
+
         self._adapter_name = adapter_name
         self._num_slaves = num_slaves
+        self._max_sync_error_mm = max_sync_error_mm
+
+        # mm를 pulse로 변환 (z축 기준)
+        self._max_sync_error_pulse = int(
+            (max_sync_error_mm / z_axis_mm_per_rev) * PULSES_PER_REVOLUTION * 2
+        )
+
         self._process = mp.Process(
-            target=_ethercat_process_loop,
-            args=( 
+            target=_ethercat_process_loop_coupling,
+            args=(
                 adapter_name, num_slaves, cycle_time_ms / 1000.0,
-                self._command_queue, self._shared_states, self._lock
+                self._command_queue, self._shared_states, self._lock,
+                self._max_sync_error_pulse,
+                self._coupling_params
             )
         )
-        self.motors: List[Motor] = [Motor(i, self._command_queue, self._shared_states, self._lock) for i in range(num_slaves)]
+        self.motors: List[MotorCoupling] = [
+            MotorCoupling(i, self._command_queue, self._shared_states, self._lock)
+            for i in range(num_slaves)
+        ]
 
     def start(self):
         self._process.start()
-        print("EtherCAT 버스 프로세스를 시작합니다.")
+        print(f"[COUPLING] EtherCAT 버스 시작")
+        print(f"  동기화 오차 허용: {self._max_sync_error_mm}mm")
+        print(f"  Cross Coupling 게인: {self._coupling_params[0]:.2f}")
+        print(f"  Cross Coupling 활성화: {self._coupling_params[1] != 0}")
 
     def stop(self):
         print("EtherCAT 버스 종료 중...")
         if self._process.is_alive():
             self._command_queue.put((-1, 'STOP_ALL', None))
-            self._process.join(timeout=2)
+            self._process.join(timeout=5)
             if self._process.is_alive():
                 print("EtherCAT 프로세스가 정상적으로 종료되지 않아 강제 종료합니다.")
                 self._process.terminate()
@@ -566,17 +626,60 @@ class EtherCATBus:
         else:
             print("EtherCAT 프로세스가 시작되지 않았거나 이미 종료되었습니다.")
 
-class Motor:
-    def __init__(self, slave_index: int, command_queue: mp.Queue, shared_states: mp.Array, lock: mp.Lock):
+    def reset_sync_error(self):
+        """동기화 오류 상태를 리셋합니다."""
+        self._command_queue.put((-1, 'RESET_SYNC_ERROR', None))
+        print("[안전] 동기화 오류 리셋 명령 전송")
+
+    @property
+    def has_sync_error(self) -> bool:
+        """동기화 오류가 발생했는지 확인합니다."""
+        return self._shared_states[4] != 0
+
+    # ========================================
+    # Cross Coupling 런타임 제어
+    # ========================================
+
+    @property
+    def coupling_gain(self) -> float:
+        """현재 Cross Coupling 게인 값을 반환합니다."""
+        return self._coupling_params[0]
+
+    @coupling_gain.setter
+    def coupling_gain(self, value: float):
+        """Cross Coupling 게인을 설정합니다. (0.0 ~ 1.0)"""
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("coupling_gain은 0.0에서 1.0 사이여야 합니다.")
+        self._coupling_params[0] = value
+        print(f"[Cross Coupling] 게인 변경: {value:.2f}")
+
+    @property
+    def coupling_enabled(self) -> bool:
+        """Cross Coupling 활성화 상태를 반환합니다."""
+        return self._coupling_params[1] != 0
+
+    @coupling_enabled.setter
+    def coupling_enabled(self, value: bool):
+        """Cross Coupling을 활성화/비활성화합니다."""
+        self._coupling_params[1] = 1.0 if value else 0.0
+        status = "활성화" if value else "비활성화"
+        print(f"[Cross Coupling] {status}")
+
+
+class MotorCoupling:
+    """
+    [COUPLING 버전] 개별 모터 제어 클래스
+    """
+
+    def __init__(self, slave_index: int, command_queue: mp.Queue,
+                 shared_states: mp.Array, lock: mp.Lock):
         self._index = slave_index
         self._command_queue = command_queue
         self._shared_states = shared_states
         self._lock = lock
-        self._pending_sdo_commands = []
-        self._axis = 'x'  # 기본값은 x축
+        self._axis = 'x'
 
     def set_axis(self, axis: str):
-        """모터의 축을 설정합니다. 'x' 또는 'z'"""
         if axis not in ['x', 'z']:
             raise ValueError("axis는 'x' 또는 'z'여야 합니다.")
         self._axis = axis
@@ -585,58 +688,48 @@ class Motor:
 
     def set_origin(self):
         self._command_queue.put((self._index, 'SET_ORIGIN', None))
-        print(f"[원점] 모터 {self._index}: 원점 설정 명령 전송.")
+        print(f"[원점] 모터 {self._index}: 원점 설정 명령 전송")
 
     def set_profile_velocity(self, rpm):
-        # bus.start()가 호출되기 전에 실행되어야 합니다.
         self._command_queue.put((self._index, 'SET_VELOCITY', rpm))
-        print(f"[속도] 모터 {self._index}: Profile Velocity 설정 명령 전송: {rpm} RPM")
+        print(f"[속도] 모터 {self._index}: {rpm} RPM")
 
     def set_profile_accel_decel(self, accel_rpm_per_sec, decel_rpm_per_sec=None):
-        # bus.start()가 호출되기 전에 실행되어야 합니다.
         accel_val = int((accel_rpm_per_sec / 60) * PULSES_PER_REVOLUTION)
         decel_val = accel_val if decel_rpm_per_sec is None else int((decel_rpm_per_sec / 60) * PULSES_PER_REVOLUTION)
         self._command_queue.put((self._index, 'SET_ACCEL', (accel_val, decel_val)))
-        print(f"[가감속] 모터 {self._index}: 가감속도 설정 명령 전송: Accel={accel_rpm_per_sec} RPM/s")
+        print(f"[가감속] 모터 {self._index}: {accel_rpm_per_sec} RPM/s")
 
     def move_to_position_mm(self, target_mm):
         self._command_queue.put((self._index, 'MOVE_TO_MM', target_mm))
-        print(f"[이동명령] 모터 {self._index}: {target_mm:.2f}mm로 이동 명령 전송")
+        print(f"[이동] 모터 {self._index}: {target_mm:.2f}mm")
 
     @property
     def status_word(self) -> int:
-        # Lock 없이 직접 접근 (Array는 원자적 접근을 보장)
-        return int(self._shared_states[self._index * 4])
-    
+        return int(self._shared_states[self._index * 5])
+
     def is_moving(self) -> bool:
-        """모터가 현재 이동 명령을 수행 중인지 확인합니다."""
-        # Lock 없이 직접 접근
-        return self._shared_states[self._index * 4 + 1] != 0
-            
+        return self._shared_states[self._index * 5 + 1] != 0
+
     @property
     def current_position_mm(self) -> float:
-        # Lock 없이 직접 접근
-        base_idx = self._index * 4
+        base_idx = self._index * 5
         current_pos = self._shared_states[base_idx + 2]
         offset = self._shared_states[base_idx + 3]
         relative_pos = current_pos - offset
-        # [중요] Position Factor 2:1 처리
-        # relative_pos는 드라이버 스케일(2배)
-        # target 계산 시에도 PULSES_PER_REVOLUTION * 2를 사용했으므로
-        # 같은 스케일을 유지하기 위해 PULSES_PER_REVOLUTION * 2로 나눔
         revolutions = relative_pos / (PULSES_PER_REVOLUTION * 2)
-        # 축에 따라 올바른 변환값 사용
         mm_per_rev = x_axis_mm_per_rev if self._axis == 'x' else z_axis_mm_per_rev
         return revolutions * mm_per_rev
 
     @property
     def current_position_pulse(self) -> int:
-        """디버깅용: 현재 펄스 위치"""
-        base_idx = self._index * 4
-        return int(self._shared_states[base_idx + 2])
+        return int(self._shared_states[self._index * 5 + 2])
 
     @property
     def offset_pulse(self) -> int:
-        """디버깅용: 오프셋 펄스"""
-        base_idx = self._index * 4
-        return int(self._shared_states[base_idx + 3])
+        return int(self._shared_states[self._index * 5 + 3])
+
+    @property
+    def has_sync_error(self) -> bool:
+        """동기화 오류가 발생했는지 확인합니다."""
+        return self._shared_states[self._index * 5 + 4] != 0

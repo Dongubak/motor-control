@@ -17,7 +17,8 @@ import time
 
 def main():
     # --- 장치 포트 및 슬레이브 수 설정 ---
-    adapter = r'\Device\NPF_{A3C1307F-C4D5-4126-8FCF-A191BF2B1257}'
+    adapter = r'\Device\NPF_{A069E3B1-2841-45BF-A5FC-25AB127788E3}'
+    # adapter = r'\Device\NPF_{A3C1307F-C4D5-4126-8FCF-A191BF2B1257}'
     NUM_MOTORS = 2  # 2개 모터 사용
 
     # --- [안전 설정] 동기화 오차 허용 범위 ---
