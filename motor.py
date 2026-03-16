@@ -122,6 +122,22 @@ def _ethercat_process_loop(
             pdo_size = master.config_map()
             print(f"[성공] PDO 맵핑 완료. Process data size: {pdo_size} bytes")
 
+            # [버그 수정] OP 전환 전 현재 위치 읽기 및 출력 버퍼 초기화
+            # slave.output이 0이면 OP 진입 즉시 target_position=0으로 모터가 이동하는 문제 방지
+            print("[초기화] OP 전환 전 현재 위치 초기화 중...")
+            for _ in range(5):  # SAFEOP TxPDO 데이터 안정화
+                master.send_processdata()
+                master.receive_processdata()
+                time.sleep(cycle_time_s)
+            for i in range(num_slaves):
+                try:
+                    current_pos = _read_actual_position(master.slaves[i])
+                    local_motor_states[i]['target_pulse'] = current_pos
+                    master.slaves[i].output = struct.pack("<H", CW_ENABLE_OPERATION) + struct.pack("<i", current_pos)
+                    print(f"  [초기화] 모터 {i}: 현재 위치 {current_pos} pulse → 출력 버퍼 설정")
+                except Exception as e:
+                    print(f"  [경고] 모터 {i} 초기 위치 읽기 실패 (0으로 유지): {e}")
+
             # 초기화 성공!
             init_success = True
             break
