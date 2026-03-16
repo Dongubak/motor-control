@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "202602061000-pyqt-gui.md",
+                "file": "202603160900-homing-limit-switch.md",
                 "mode": "preview",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "202602061000-pyqt-gui"
+              "title": "202603160900-homing-limit-switch"
             }
           }
         ]
@@ -44,7 +44,7 @@
                 "autoReveal": false
               },
               "icon": "lucide-folder-closed",
-              "title": "Files"
+              "title": "파일 탐색기"
             }
           },
           {
@@ -78,7 +78,8 @@
       }
     ],
     "direction": "horizontal",
-    "width": 377.5
+    "width": 377.5,
+    "collapsed": true
   },
   "right": {
     "id": "877481ce01e17ca4",
@@ -174,45 +175,48 @@
   },
   "left-ribbon": {
     "hiddenItems": {
-      "switcher:Open quick switcher": false,
-      "graph:Open graph view": false,
-      "canvas:Create new canvas": false,
-      "daily-notes:Open today's daily note": false,
-      "templates:Insert template": false,
-      "command-palette:Open command palette": false,
-      "bases:Create new base": false
+      "switcher:빠른 전환기 열기": false,
+      "graph:그래프 뷰 열기": false,
+      "canvas:새 캔버스 만들기": false,
+      "daily-notes:오늘의 일일 노트 열기": false,
+      "templates:템플릿 삽입": false,
+      "command-palette:명령어 팔레트 열기": false,
+      "bases:새 베이스 생성하기": false
     }
   },
   "active": "f682d56127e0edd5",
   "lastOpenFiles": [
+    "202602031200-ethercat-motor-control-system.md",
+    "202603160900-homing-limit-switch.md",
+    "202603130002-pulse-revolution-mm-calculation.md",
+    "MOC-motor-control.md",
+    "Welcome.md",
+    "분해능 확인.png",
+    "202603130001-bugfix-double-move-and-z-direction.md",
+    "202602061000-pyqt-gui.md",
     "202602051000-cross-coupling.md",
+    "202602041400-git-github-setup.md",
+    "202602041300-safety-synchronization.md",
+    "202602031211-pdo-communication.md",
+    "202602031210-synchronization.md",
+    "202602031209-fault-handling.md",
+    "202602031208-position-control.md",
+    "202602031207-trajectory-interpolation.md",
+    "202602031206-main-execution-flow.md",
+    "202602031205-cia402-state-machine.md",
+    "202602031204-csp-mode.md",
+    "202602031203-ethercat-process-loop.md",
+    "202602031202-motor-class.md",
+    "202602031201-ethercat-bus-class.md",
     "MOC-motor-control.md.tmp.24912.1770342367885",
     "MOC-motor-control.md.tmp.24912.1770342354414",
     "MOC-motor-control.md.tmp.24912.1770342348231",
-    "202602061000-pyqt-gui.md",
     "202602061000-pyqt-gui.md.tmp.24912.1770342333049",
-    "202602041300-safety-synchronization.md",
-    "MOC-motor-control.md",
-    "분해능 확인.png",
-    "Welcome.md",
     "MOC-motor-control.md.tmp.17356.1770206269345",
     "MOC-motor-control.md.tmp.17356.1770206260244",
     "MOC-motor-control.md.tmp.17356.1770206252053",
-    "202602041400-git-github-setup.md",
-    "202602031204-csp-mode.md",
     "MOC-motor-control.md.tmp.17356.1770202996969",
     "MOC-motor-control.md.tmp.17356.1770202986671",
-    "MOC-motor-control.md.tmp.17356.1770202979324",
-    "202602031203-ethercat-process-loop.md",
-    "202602031200-ethercat-motor-control-system.md",
-    "202602031202-motor-class.md",
-    "202602031201-ethercat-bus-class.md",
-    "202602031206-main-execution-flow.md",
-    "202602031210-synchronization.md",
-    "202602031211-pdo-communication.md",
-    "202602031205-cia402-state-machine.md",
-    "202602031209-fault-handling.md",
-    "202602031208-position-control.md",
-    "202602031207-trajectory-interpolation.md"
+    "MOC-motor-control.md.tmp.17356.1770202979324"
   ]
 }

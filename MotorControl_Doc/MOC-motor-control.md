@@ -57,6 +57,7 @@ mm 입력 → 펄스 변환 → S-Curve 보간 → CSP 전송
 - [[202602031210-synchronization|다축 동기화]] - 여러 모터 동시 제어
 - [[202602041300-safety-synchronization|안전 동기화 분석]] ⭐ **중량물 리프팅**
 - [[202602051000-cross-coupling|Cross Coupling]] ⭐ **위치 오차 보정** (NEW!)
+- [[202603160900-homing-limit-switch|Z축 Homing — 리미트 스위치 도입 절차]] ⭐ **원점복귀 구현** (NEW!)
 
 #### 인터페이스
 
@@ -124,6 +125,8 @@ mm 입력 → 펄스 변환 → S-Curve 보간 → CSP 전송
 - `#safety` - [[202602031209-fault-handling|Fault 처리]], [[202602041300-safety-synchronization|안전 동기화]]
 - `#error-handling` - [[202602031209-fault-handling|Fault 처리]]
 - `#critical` - [[202602041300-safety-synchronization|안전 동기화 분석]]
+- `#homing` - [[202603160900-homing-limit-switch|Z축 Homing]]
+- `#limit-switch` - [[202603160900-homing-limit-switch|Z축 Homing]]
 
 ### 개발 환경
 - `#git` - [[202602041400-git-github-setup|Git/GitHub 연동]]
@@ -171,6 +174,7 @@ mm 입력 → 펄스 변환 → S-Curve 보간 → CSP 전송
 
 | 날짜 | 변경 내용 |
 |------|-----------|
+| 2026-03-16 | Z축 Homing 리미트 스위치 도입 절차 추가 (17개 노트) |
 | 2026-02-06 | PyQt5 GUI 문서 추가 (16개 노트) |
 | 2026-02-05 | Cross Coupling 문서 추가 (15개 노트) |
 | 2026-02-04 | Git/GitHub 연동 문서 추가 (14개 노트) |
