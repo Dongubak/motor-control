@@ -307,61 +307,61 @@ def _ethercat_process_loop_coupling(
                 for i in range(num_slaves)
             ]
 
-            # 이동 중인 모터가 있는지 확인
-            all_moving = all(
-                local_motor_states[i]['trajectory'] is not None
-                for i in range(num_slaves)
-            )
-            any_moving = any(
-                local_motor_states[i]['trajectory'] is not None
-                for i in range(num_slaves)
-            )
+            # 이동 중인 모터 목록 계산 (trajectory가 있는 슬레이브만)
+            moving_motors = [
+                i for i in range(num_slaves)
+                if local_motor_states[i]['trajectory'] is not None
+            ]
 
             # ========================================
             # [안전 기능] 다축 위치 차이 모니터링 (이동 평균 필터)
-            # 순간값 대신 최근 ma_window 사이클의 평균 위치 차이로 비교:
-            #   - 노이즈성 스파이크에 의한 오작동 방지
-            #   - 이동 중일 때만 히스토리 갱신
+            # 두 모터가 모두 이동 중인 쌍에 대해서만 모니터링:
+            #   - 정지 모터와의 위치차로 인한 오작동 방지
+            #   - 노이즈성 스파이크에 의한 오작동 방지 (이동 평균)
             # ========================================
-            if num_slaves >= 2 and not sync_error_detected and any_moving:
+            if num_slaves >= 2 and not sync_error_detected:
                 for i in range(num_slaves - 1):
-                    position_diff = abs(relative_positions[i] - relative_positions[i + 1])
-                    diff_histories[i].append(position_diff)
+                    if (local_motor_states[i]['trajectory'] is not None and
+                            local_motor_states[i + 1]['trajectory'] is not None):
+                        position_diff = abs(relative_positions[i] - relative_positions[i + 1])
+                        diff_histories[i].append(position_diff)
 
-                    avg_diff = sum(diff_histories[i]) / len(diff_histories[i])
+                        avg_diff = sum(diff_histories[i]) / len(diff_histories[i])
 
-                    if avg_diff > max_sync_error_pulse:
-                        sync_error_detected = True
-                        raw_mm = position_diff / (PULSES_PER_REVOLUTION * 2) * z_axis_mm_per_rev
-                        avg_mm = avg_diff / (PULSES_PER_REVOLUTION * 2) * z_axis_mm_per_rev
+                        if avg_diff > max_sync_error_pulse:
+                            sync_error_detected = True
+                            raw_mm = position_diff / (PULSES_PER_REVOLUTION * 2) * z_axis_mm_per_rev
+                            avg_mm = avg_diff / (PULSES_PER_REVOLUTION * 2) * z_axis_mm_per_rev
 
-                        print(f"\n{'='*60}")
-                        print(f"[긴급 정지] 동기화 오차 이동 평균 초과!")
-                        print(f"  Motor {i} vs Motor {i+1}")
-                        print(f"  현재 위치 차이: {position_diff} pulse ({raw_mm:.3f} mm)")
-                        print(f"  이동 평균 ({len(diff_histories[i])}/{ma_window}): "
-                              f"{int(avg_diff)} pulse ({avg_mm:.3f} mm)")
-                        print(f"  임계값: {max_sync_error_pulse} pulse")
-                        print(f"{'='*60}")
+                            print(f"\n{'='*60}")
+                            print(f"[긴급 정지] 동기화 오차 이동 평균 초과!")
+                            print(f"  Motor {i} vs Motor {i+1}")
+                            print(f"  현재 위치 차이: {position_diff} pulse ({raw_mm:.3f} mm)")
+                            print(f"  이동 평균 ({len(diff_histories[i])}/{ma_window}): "
+                                  f"{int(avg_diff)} pulse ({avg_mm:.3f} mm)")
+                            print(f"  임계값: {max_sync_error_pulse} pulse")
+                            print(f"{'='*60}")
 
-                        for j in range(num_slaves):
-                            if local_motor_states[j]['trajectory'] is not None:
-                                local_motor_states[j]['trajectory'] = None
-                                current_pos = positions[j]
-                                local_motor_states[j]['target_pulse'] = current_pos
-                                print(f"  → 모터 {j} 긴급 정지: {current_pos} pulse에 고정")
-                        break
+                            for j in range(num_slaves):
+                                if local_motor_states[j]['trajectory'] is not None:
+                                    local_motor_states[j]['trajectory'] = None
+                                    current_pos = positions[j]
+                                    local_motor_states[j]['target_pulse'] = current_pos
+                                    print(f"  → 모터 {j} 긴급 정지: {current_pos} pulse에 고정")
+                            break
 
             # ========================================
             # [Cross Coupling] 위치 오차 보정
+            # 이동 중인 모터끼리만 평균 위치를 계산하여 보정:
+            #   - 정지 모터가 포함되면 평균이 왜곡되어 오보정 발생
             # ========================================
             coupling_correction = [0] * num_slaves
 
-            if coupling_enabled and num_slaves >= 2 and all_moving and not sync_error_detected:
-                # 평균 상대 위치 계산
-                avg_relative_position = sum(relative_positions) / num_slaves
+            if coupling_enabled and len(moving_motors) >= 2 and not sync_error_detected:
+                # 이동 중인 모터들의 평균 상대 위치
+                avg_relative_position = sum(relative_positions[i] for i in moving_motors) / len(moving_motors)
 
-                for i in range(num_slaves):
+                for i in moving_motors:
                     # 각 모터의 평균 위치로부터의 오차
                     error_from_avg = relative_positions[i] - avg_relative_position
 
@@ -372,21 +372,25 @@ def _ethercat_process_loop_coupling(
 
                 # 디버그 출력 (매 50 사이클마다)
                 if cycle_counter % 50 == 0:
-                    print(f"[Cross Coupling] 상대위치: {[int(p) for p in relative_positions]}")
-                    print(f"  평균: {int(avg_relative_position)}, 보정량: {coupling_correction}")
+                    print(f"[Cross Coupling] 이동 모터: {moving_motors}, "
+                          f"상대위치: {[int(relative_positions[i]) for i in moving_motors]}")
+                    print(f"  평균: {int(avg_relative_position)}, "
+                          f"보정량: {[coupling_correction[i] for i in moving_motors]}")
 
-            # 동기화 모니터링 디버그 출력 (이동 평균 포함)
-            if cycle_counter % 50 == 0 and any_moving and num_slaves >= 2:
+            # 동기화 모니터링 디버그 출력 (이동 평균 포함, 이동 중인 쌍만)
+            if cycle_counter % 50 == 0 and num_slaves >= 2:
                 for i in range(num_slaves - 1):
-                    diff = abs(relative_positions[i] - relative_positions[i + 1])
-                    diff_mm = diff / (PULSES_PER_REVOLUTION * 2) * z_axis_mm_per_rev
-                    if diff_histories[i]:
-                        avg_d = sum(diff_histories[i]) / len(diff_histories[i])
-                        avg_mm = avg_d / (PULSES_PER_REVOLUTION * 2) * z_axis_mm_per_rev
-                        print(f"[동기화] M{i}-M{i+1} 위치차: {diff_mm:.3f}mm "
-                              f"(이동평균: {avg_mm:.3f}mm, {len(diff_histories[i])}/{ma_window})")
-                    else:
-                        print(f"[동기화] M{i}-M{i+1} 위치차: {diff_mm:.3f}mm")
+                    if (local_motor_states[i]['trajectory'] is not None and
+                            local_motor_states[i + 1]['trajectory'] is not None):
+                        diff = abs(relative_positions[i] - relative_positions[i + 1])
+                        diff_mm = diff / (PULSES_PER_REVOLUTION * 2) * z_axis_mm_per_rev
+                        if diff_histories[i]:
+                            avg_d = sum(diff_histories[i]) / len(diff_histories[i])
+                            avg_mm = avg_d / (PULSES_PER_REVOLUTION * 2) * z_axis_mm_per_rev
+                            print(f"[동기화] M{i}-M{i+1} 위치차: {diff_mm:.3f}mm "
+                                  f"(이동평균: {avg_mm:.3f}mm, {len(diff_histories[i])}/{ma_window})")
+                        else:
+                            print(f"[동기화] M{i}-M{i+1} 위치차: {diff_mm:.3f}mm")
 
             # 3. Fault 확인
             fault_detected = False
