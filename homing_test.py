@@ -335,7 +335,7 @@ def main():
         print(f"  [슬레이브 {HW_HOMING_IDX}] 하드웨어 Homing 수행")
         print(f"    - Z축 이동 경로 전 구간 장애물 없음 확인")
         print(f"    - 하단 리미트 스위치(POT, DI1, Pin 11) 배선 확인")
-        print(f"      NO → Drive Pin 6 (+24V),  COM → Drive Pin 11")
+        print(f"      Pin 6 → GND(0V),  NO → 24V(+),  COM → Drive Pin 11")
         print(f"    - 상단 리미트 스위치(NOT, DI2, Pin 12) 배선 확인")
         print(f"  [슬레이브 {SW_ORIGIN_IDX}] 소프트웨어 원점 설정")
         print(f"    - Homing 시작 전 슬레이브 {HW_HOMING_IDX}과 동일한 물리적 높이에")
@@ -378,7 +378,7 @@ def main():
             print(f"\n  Homing 실패")
             print(f"\n  점검사항:")
             print(f"    1. DI1(POT) 배선 재확인 (드라이브 모니터링 툴로 DI1 ON/OFF 확인)")
-            print(f"    2. Index 펄스 배선 불가 시 HOMING_METHOD = -6 으로 변경")
+            print(f"    2. Index 펄스는 내부 엔코더에서 자동 감지 — 배선 재확인 불필요")
             print(f"    3. SEARCH_SPEED_RPM 값을 낮춰 재시도")
             _print_fault_codes(master, NUM_SLAVES)
 
