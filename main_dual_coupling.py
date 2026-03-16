@@ -1,10 +1,7 @@
 """
-main_dual_coupling.py - Cross Coupling 기능 테스트 코드
+main_dual_coupling.py - Cross Coupling 적용 이동 및 원점 복귀
 
-특징:
-1. motor_coupling.py의 EtherCATBusCoupling 클래스 사용
-2. Cross Coupling 게인 런타임 조절
-3. 위치 차이 모니터링 및 동기화 품질 평가
+Cross Coupling을 활성화한 상태로 목표 위치까지 이동 후 원점으로 복귀합니다.
 
 사용법:
     python main_dual_coupling.py
@@ -95,10 +92,34 @@ def read_drive_fault_codes(adapter: str, num_slaves: int):
         master.close()
 
 
+def wait_move(motor1, motor2, timeout=60):
+    """두 모터가 이동 완료될 때까지 위치를 출력하며 대기합니다."""
+    time.sleep(0.2)
+    start = time.monotonic()
+    while motor1.is_moving() or motor2.is_moving():
+        pos_diff = abs(motor1.current_position_mm - motor2.current_position_mm)
+        print(f"--> M1: {motor1.current_position_mm:7.2f}mm  "
+              f"M2: {motor2.current_position_mm:7.2f}mm  "
+              f"차이: {pos_diff:.3f}mm", end='\r')
+
+        if motor1.has_sync_error or motor2.has_sync_error:
+            print(f"\n[긴급 정지] 동기화 오류 감지!")
+            return False
+
+        time.sleep(0.05)
+        if time.monotonic() - start > timeout:
+            print(f"\n[경고] 이동 타임아웃!")
+            return False
+    return True
+
+
 def main():
     # --- 장치 포트 및 슬레이브 수 설정 ---
     adapter = r'\Device\NPF_{CD2150F2-B355-4A6F-95BA-EB897A3726BF}'  # Realtek USB 2.5GbE
     NUM_MOTORS = 3
+
+    # --- 이동 목표 위치 (mm) ---
+    TARGET_MM = 10
 
     # --- Cross Coupling 설정 ---
     COUPLING_GAIN = 0.001     # 초기 게인 (0.0 ~ 1.0)
@@ -122,15 +143,13 @@ def main():
     motor2 = bus.motors[2]
 
     try:
-        # --- 축 설정 ---
+        # --- 축 / SDO 설정 (버스 시작 전) ---
         motor1.set_axis('z')
         motor2.set_axis('z')
-
-        # --- SDO 설정 ---
-        motor1.set_profile_velocity(rpm=50)
-        motor1.set_profile_accel_decel(accel_rpm_per_sec=50)
-        motor2.set_profile_velocity(rpm=50)
-        motor2.set_profile_accel_decel(accel_rpm_per_sec=50)
+        motor1.set_profile_velocity(rpm=10)
+        motor1.set_profile_accel_decel(accel_rpm_per_sec=5)
+        motor2.set_profile_velocity(rpm=10)
+        motor2.set_profile_accel_decel(accel_rpm_per_sec=5)
 
         # --- 버스 시작 ---
         bus.start()
@@ -149,15 +168,11 @@ def main():
         motor1.set_origin()
         motor2.set_origin()
         time.sleep(0.5)
+        print(f"\n원점 위치: M1={motor1.current_position_mm:.2f}mm  M2={motor2.current_position_mm:.2f}mm")
 
-        print(f"\n원점 설정 후:")
-        print(f"  M1={motor1.current_position_mm:.2f}mm, M2={motor2.current_position_mm:.2f}mm")
-
-        # --- Cross Coupling 테스트 ---
+        # --- Cross Coupling 이동 ---
         print("\n" + "="*60)
-        print("  [Cross Coupling 테스트]")
-        print(f"  게인: {bus.coupling_gain:.2f}")
-        print(f"  활성화: {bus.coupling_enabled}")
+        print(f"  [Cross Coupling 이동]  목표: {TARGET_MM}mm  게인: {COUPLING_GAIN}")
         print("="*60)
 
         # 테스트 1: Cross Coupling 활성화 상태로 이동
@@ -177,21 +192,19 @@ def main():
             max_diff_test1 = max(max_diff_test1, pos_diff)
             print(f"--> M1: {motor1.current_position_mm:7.2f}mm, M2: {motor2.current_position_mm:7.2f}mm, 차이: {pos_diff:.3f}mm", end='\r')
 
-            if motor1.has_sync_error or motor2.has_sync_error:
-                print(f"\n[긴급 정지] 동기화 오류!")
-                break
+        ok = wait_move(motor1, motor2)
+        max_diff_go = abs(motor1.current_position_mm - motor2.current_position_mm)
 
-            time.sleep(0.05)
-            if time.monotonic() - start_time > 60:
-                break
+        print(f"\n이동 완료: M1={motor1.current_position_mm:.2f}mm  "
+              f"M2={motor2.current_position_mm:.2f}mm  "
+              f"최종 차이: {max_diff_go:.3f}mm")
 
-        print(f"\n\n[테스트 1 결과] Cross Coupling ON")
-        print(f"  최대 위치 차이: {max_diff_test1:.3f}mm")
-        print(f"  최종 위치: M1={motor1.current_position_mm:.2f}mm, M2={motor2.current_position_mm:.2f}mm")
+        if not ok:
+            bus.reset_sync_error()
 
         time.sleep(1)
 
-        # 원점 복귀
+        # --- 원점 복귀 ---
         print("\n--- 원점 복귀 ---")
         motor1.move_to_position_mm(TARGET_MM)
         motor2.move_to_position_mm(TARGET_MM)
@@ -208,9 +221,10 @@ def main():
 
         print(f"\n")
 
-        # --- 결과 요약 ---
         print("\n" + "="*60)
-        print("  [테스트 결과 요약]")
+        print("  [완료]")
+        print(f"  이동 시 최종 위치차: {max_diff_go:.3f}mm")
+        print(f"  복귀 시 최종 위치차: {max_diff_ret:.3f}mm")
         print("="*60)
         print(f"  테스트 1 (Coupling ON):  최대 위치차 {max_diff_test1:.3f}mm")
 

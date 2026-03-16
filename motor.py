@@ -226,6 +226,35 @@ def _ethercat_process_loop(
                 ## QES1: 큐 원소 의미 ---------------------
 
                 if cmd == 'STOP_ALL':
+                    # ── CiA 402 종료 시퀀스 (EtherCAT 통신이 살아있는 동안 실행) ──
+                    # finally 블록에서 실행하면 워치독이 이미 OP→SAFEOP 전환한 후라
+                    # 슬레이브가 제어워드를 무시함. 루프 내부에서 처리해야 함.
+                    print("\n[종료] CiA 402 종료 시퀀스 시작...")
+
+                    def _shutdown_cycles(cw_value, n_cycles):
+                        for _ in range(n_cycles):
+                            for j in range(num_slaves):
+                                try:
+                                    cur = _read_actual_position(master.slaves[j])
+                                    master.slaves[j].output = (
+                                        struct.pack("<H", cw_value) + struct.pack("<i", cur)
+                                    )
+                                except Exception:
+                                    pass
+                            master.send_processdata()
+                            master.receive_processdata()
+                            time.sleep(cycle_time_s)
+
+                    print("  1단계: Disable Operation (Op Enabled → Switched On)")
+                    _shutdown_cycles(CW_SWITCH_ON, 10)        # 10 × cycle = 100ms
+
+                    print("  2단계: Shutdown (Switched On → Ready To Switch On)")
+                    _shutdown_cycles(CW_SHUTDOWN, 5)          # 5 × cycle = 50ms
+
+                    print("  3단계: Disable Voltage (Ready To Switch On → Switch On Disabled)")
+                    _shutdown_cycles(CW_DISABLE_VOLTAGE, 5)   # 5 × cycle = 50ms
+
+                    print("  [완료] CiA 402 종료 시퀀스 완료")
                     is_running = False
                     break
                 elif cmd == 'SET_AXIS':
@@ -452,70 +481,12 @@ def _ethercat_process_loop(
     except Exception as e:
         print(f"EtherCAT 프로세스 에러: {e}")
     finally:
-        print("\n[종료 시퀀스 시작]")
+        # CiA 402 종료는 루프 내부(STOP_ALL 처리)에서 이미 완료됨.
+        # 여기서는 EtherCAT 링크 레벨만 정리한다.
         try:
-            master.read_state()
-            if len(master.slaves) > 0 and master.slaves[0].state == pysoem.OP_STATE:
-                # [긴급 안전] 모든 모터를 현재 위치로 고정
-                print("  [안전] 모든 모터를 현재 위치에 고정합니다...")
-                for i in range(num_slaves):
-                    try:
-                        current_pos = _read_actual_position(master.slaves[i])
-                        local_motor_states[i]['trajectory'] = None
-                        local_motor_states[i]['target_pulse'] = current_pos
-                        # Controlword는 유지, Target Position만 현재 위치로
-                        master.slaves[i].output = struct.pack("<H", CW_ENABLE_OPERATION) + struct.pack("<i", current_pos)
-                    except:
-                        pass
-
-                # 현재 위치 고정 명령 전송 (여러 번 반복하여 확실히 적용)
-                for _ in range(5):
-                    master.send_processdata()
-                    master.receive_processdata()
-                    time.sleep(0.02)
-
-                print("  [완료] 모터 정지 완료")
-
-                # [1단계] Disable Operation (0x0007) - Operation Enabled → Switched On
-                print("  1단계: Disable Operation (모터 동작 중지)")
-                for i in range(num_slaves):
-                    try:
-                        current_pos = _read_actual_position(master.slaves[i])
-                        master.slaves[i].output = struct.pack("<H", CW_SWITCH_ON) + struct.pack("<i", current_pos)
-                    except Exception as e:
-                        print(f"    모터 {i} Disable Operation 실패: {e}")
-                master.send_processdata()
-                time.sleep(0.1)
-
-                # [2단계] Shutdown (0x0006) - Switched On → Ready to Switch On
-                print("  2단계: Shutdown (전원 준비)")
-                for i in range(num_slaves):
-                    try:
-                        current_pos = _read_actual_position(master.slaves[i])
-                        master.slaves[i].output = struct.pack("<H", CW_SHUTDOWN) + struct.pack("<i", current_pos)
-                    except:
-                        pass
-                master.send_processdata()
-                time.sleep(0.1)
-
-                # [3단계] Disable Voltage (0x0000) - Ready to Switch On → Switch On Disabled
-                print("  3단계: Disable Voltage (전원 차단)")
-                for i in range(num_slaves):
-                    try:
-                        current_pos = _read_actual_position(master.slaves[i])
-                        master.slaves[i].output = struct.pack("<H", CW_DISABLE_VOLTAGE) + struct.pack("<i", current_pos)
-                    except:
-                        pass
-                master.send_processdata()
-                time.sleep(0.2)
-
-                # [4단계] EtherCAT 상태를 INIT으로 전환
-                print("  4단계: EtherCAT INIT 상태로 전환")
-                master.state = pysoem.INIT_STATE
-                master.write_state()
-                time.sleep(0.1)
-
-                print("  [완료] 종료 시퀀스 완료")
+            master.state = pysoem.INIT_STATE
+            master.write_state()
+            time.sleep(0.1)
         except Exception as e:
             print(f"  [경고] 종료 중 에러 (무시): {e}")
         finally:
