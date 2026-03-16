@@ -241,6 +241,57 @@ def _run_homing_single(master, all_slaves, hw_idx: int,
         time.sleep(cycle_time_s)
 
 
+def _graceful_shutdown(master, num_slaves: int):
+    """CiA 402 단계적 종료: Operation Enabled → Switch On → Ready → Disabled."""
+    print("  [1] 속도=0 유지...")
+    for slave in master.slaves[:num_slaves]:
+        try: _write_cw(slave, CW_ENABLE_OPERATION)
+        except: pass
+    for _ in range(5):
+        try:
+            master.send_processdata()
+            master.receive_processdata()
+        except: pass
+        time.sleep(0.02)
+
+    print("  [2] Switch On...")
+    for slave in master.slaves[:num_slaves]:
+        try: _write_cw(slave, CW_SWITCH_ON)
+        except: pass
+    for _ in range(3):
+        try:
+            master.send_processdata()
+            master.receive_processdata()
+        except: pass
+        time.sleep(0.03)
+
+    print("  [3] Shutdown (Ready to Switch On)...")
+    for slave in master.slaves[:num_slaves]:
+        try: _write_cw(slave, CW_SHUTDOWN)
+        except: pass
+    for _ in range(3):
+        try:
+            master.send_processdata()
+            master.receive_processdata()
+        except: pass
+        time.sleep(0.03)
+
+    print("  [4] Disable Voltage...")
+    for slave in master.slaves[:num_slaves]:
+        try: _write_cw(slave, CW_DISABLE_VOLTAGE)
+        except: pass
+    for _ in range(3):
+        try:
+            master.send_processdata()
+            master.receive_processdata()
+        except: pass
+        time.sleep(0.03)
+
+    master.state = pysoem.INIT_STATE
+    master.write_state()
+    time.sleep(0.1)
+
+
 def _print_fault_codes(master, num_slaves: int):
     print("\n[진단] 드라이브 Fault 코드:")
     for i, slave in enumerate(master.slaves[:num_slaves]):
@@ -387,23 +438,9 @@ def main():
     except Exception as e:
         print(f"\n[오류] {type(e).__name__}: {e}")
     finally:
-        print(f"\n[종료] 정지 시퀀스...")
+        print(f"\n[종료] 단계적 정지 시퀀스...")
         try:
-            for slave in master.slaves[:NUM_SLAVES]:
-                try:
-                    _write_cw(slave, CW_DISABLE_VOLTAGE)
-                except Exception:
-                    pass
-            for _ in range(5):
-                try:
-                    master.send_processdata()
-                    master.receive_processdata()
-                except Exception:
-                    pass
-                time.sleep(0.02)
-            master.state = pysoem.INIT_STATE
-            master.write_state()
-            time.sleep(0.1)
+            _graceful_shutdown(master, NUM_SLAVES)
         except Exception:
             pass
         master.close()
