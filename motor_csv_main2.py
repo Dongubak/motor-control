@@ -125,13 +125,32 @@ def wait_motors(motor1, motor2, label: str, timeout: float = 60.0):
 # ─────────────────────────────────────────────────────────────
 def main():
     # ── 장치 설정 ──
-    ADAPTER    = r'\Device\NPF_{CD2150F2-B355-4A6F-95BA-EB897A3726BF}'
+    ADAPTER    = r'\Device\NPF_{CD2150F2-B355-4A6F-95BA-EB897A3726BF}' # 현장
+    # ADAPTER = r'\Device\NPF_{D1B66F5F-FF8A-4D4D-8C7C-2FF2547CE945}'
+
+    #### 현장에서 확인할 변수 목록 ####
+    # NUM_MOTORS
+    # RPM
+    # ACCEL_RPM_PER_S
+    # TARGET_MM
+
+    # NUM_MOTORS = 3 # 현장
     NUM_MOTORS = 3
 
     # ── CSV 모드 파라미터 ──
-    RPM             = 300    # 최대 이동 속도 (RPM)
-    ACCEL_RPM_PER_S = 300    # 가감속 (RPM/sec)
-    TARGET_MM       = 600    # 이동 목표 (mm)  ※ z축 이동 한계 ~12.89mm 이내로 설정
+
+
+    ###### 현장 용 ######
+    RPM             = 500    # 최대 이동 속도 (RPM)
+    ACCEL_RPM_PER_S = 500    # 가감속 (RPM/sec)
+    TARGET_MM       = 1000    # 이동 목표 (mm)  ※ z축 이동 한계 ~12.89mm 이내로 설정
+
+
+    ###### 사무실 내 시연 용 ######
+
+    # RPM             = 10    # 최대 이동 속도 (RPM)
+    # ACCEL_RPM_PER_S = 10    # 가감속 (RPM/sec)
+    # TARGET_MM       = 10    # 이동 목표 (mm)  ※ z축 이동 한계 ~12.89mm 이내로 설정
 
     # ── Cross Coupling 파라미터 ──
     COUPLING_GAIN   = 0.01  # [1/sec]: 1mm 오차 → 0.01mm/sec 속도 보정
@@ -150,8 +169,13 @@ def main():
         ma_window=MA_WINDOW,
     )
 
+    ###### 현장 시연용 #####
     motor1 = bus.motors[1]
     motor2 = bus.motors[2]
+
+    #### 사무실 시연 용 #####
+    # motor1 = bus.motors[0]
+    # motor2 = bus.motors[1]
 
     try:
         # ── 축 설정 ──
@@ -197,8 +221,8 @@ def main():
         bus.coupling_enabled = True
         bus.coupling_gain    = COUPLING_GAIN
 
-        motor1.move_to_position_mm(-TARGET_MM)
-        motor2.move_to_position_mm(-TARGET_MM)
+        motor1.move_to_position_mm(TARGET_MM)
+        motor2.move_to_position_mm(TARGET_MM)
         time.sleep(0.2)
 
         max_diff_fwd, err_fwd = wait_motors(motor1, motor2, "전진", timeout=60.0)
@@ -222,8 +246,8 @@ def main():
 
             bus.coupling_enabled = True
 
-            motor1.move_to_position_mm(0)
-            motor2.move_to_position_mm(0)
+            motor1.move_to_position_mm(TARGET_MM)
+            motor2.move_to_position_mm(TARGET_MM)
             time.sleep(0.2)
 
             max_diff_ret, _ = wait_motors(motor1, motor2, "복귀", timeout=60.0)

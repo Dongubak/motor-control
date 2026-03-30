@@ -37,7 +37,7 @@ CW_FAULT_RESET      = 0x0080
 # 기계 상수
 # ─────────────────────────────────────────────────────────────
 PULSES_PER_REVOLUTION = 8_388_608          # 모터 엔코더 분해능 (0x2002 = 2^23)
-EFFECTIVE_PPR         = PULSES_PER_REVOLUTION * 2  # 전기적 기어비 ×2 적용
+EFFECTIVE_PPR         = PULSES_PER_REVOLUTION      # 8,388,608 pulse/rev (전기적 기어비 1:1)
 
 x_axis_mm_per_rev = 11.9993131404          # x축: 1 revolution당 이동 거리 (mm)
 z_axis_mm_per_rev = 5.99965657019          # z축: 1 revolution당 이동 거리 (mm)
