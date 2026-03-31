@@ -118,9 +118,9 @@ def wait_motor(motor, label: str, timeout: float = 60.0):
 # ─────────────────────────────────────────────────────────────
 def main():
     # ── 장치 설정 ──
-    ADAPTER    = r'\Device\NPF_{CD2150F2-B355-4A6F-95BA-EB897A3726BF}'  # 현장
-    # ADAPTER = r'\Device\NPF_{D1B66F5F-FF8A-4D4D-8C7C-2FF2547CE945}'  # 사무실
-
+    # ADAPTER    = r'\Device\NPF_{CD2150F2-B355-4A6F-95BA-EB897A3726BF}'  # 현장
+    ADAPTER = r'\Device\NPF_{D1B66F5F-FF8A-4D4D-8C7C-2FF2547CE945}'  # 사무실
+    # ADAPTER    = r'\Device\NPF_{60F43190-600E-4F16-972D-A254AA5F3E19}'  # 현장
     NUM_MOTORS = 1   # X축 슬레이브 0만 제어
 
     #### 현장에서 확인할 변수 목록 ####
@@ -134,9 +134,9 @@ def main():
     # TARGET_MM       = 500    # 이동 목표 (mm)  ※ X축 이동 한계 내로 설정
 
     ###### 사무실 내 시연 용 ######
-    RPM             = 500
-    ACCEL_RPM_PER_S = 500
-    TARGET_MM       = -100
+    RPM             = 30
+    ACCEL_RPM_PER_S = 30
+    TARGET_MM       = -200
     # ── 버스 생성 (Cross Coupling 비활성 — 단일 모터) ──
     bus = EtherCATBusCSV(
         adapter_name=ADAPTER,
